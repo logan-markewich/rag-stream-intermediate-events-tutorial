@@ -2,85 +2,16 @@ import json
 import time
 from queue import Queue
 from typing import List
-from llama_index.core.instrumentation.events.base import BaseEvent
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from llama_index.core.chat_engine.types import BaseChatEngine
 from llama_index.core.llms import ChatMessage, MessageRole
-from llama_index.core.instrumentation import get_dispatcher
-from llama_index.core.instrumentation.event_handlers import BaseEventHandler
-from llama_index.core.instrumentation.events.retrieval import (
-    RetrievalEndEvent,
-    RetrievalStartEvent
-)
-from llama_index.core.instrumentation.events.embedding import (
-    EmbeddingEndEvent
-)
-from llama_index.core.instrumentation.events.llm import (
-    LLMChatEndEvent
-)
-from llama_index.core.instrumentation.events.chat_engine import (
-    StreamChatDeltaReceivedEvent,
-    StreamChatStartEvent,
-    StreamChatEndEvent
-)
 from llama_index.core.utilities.token_counting import TokenCounter
 from app.engine import get_chat_engine
+from app.engine.workflow import ChatEngine, ProgressEvent
 
 chat_router = r = APIRouter()
 
-dispatcher = get_dispatcher()
-
-class EventToSend(BaseModel):
-    type:str = Field(default='data', pattern="data|text")
-    status:str = Field(default="loading", pattern="loading|done")
-    is_last_event:bool = False
-    message:str
-
-tokens_used = {
-    "in": 0,
-    "out": 0,
-}
-event_q = Queue()
-class CustomEventHandler(BaseEventHandler):
-    def handle(self, event: BaseEvent) -> None:
-        if isinstance(event, RetrievalStartEvent):
-            event_q.put(EventToSend(
-                message="Retrieving relevant nodes..."
-            ))
-        elif isinstance(event, EmbeddingEndEvent):
-            event_q.put(EventToSend(
-                status="done",
-                message=f"Done embedding {len(event.chunks)} query chunks for retrieval."
-            ))
-        elif isinstance(event, RetrievalEndEvent):
-            event_q.put(EventToSend(
-                status="done",
-                message=f"Retrieved {len(event.nodes)} relevant nodes for context."
-            ))
-        elif isinstance(event, StreamChatStartEvent):
-            event_q.put(EventToSend(
-                status="done",
-                message="Started streaming chat response."
-            ))
-        elif isinstance(event, StreamChatDeltaReceivedEvent):
-            event_q.put(EventToSend(
-                type="text",
-                message=str(event.delta)
-            ))
-        elif isinstance(event, LLMChatEndEvent):
-            token_counter = TokenCounter()
-            tokens_used['in'] += token_counter.estimate_tokens_in_messages(event.messages)
-            tokens_used['out'] += token_counter.get_string_tokens(str(event.response.message))
-        elif isinstance(event, StreamChatEndEvent):
-            event_q.put(EventToSend(
-                status="done",
-                is_last_event=True,
-                message=f"Finished streaming chat response. Tokens used -> Input: {tokens_used['in']} & Output: {tokens_used['out']}"
-            ))
-        
-dispatcher.add_event_handler(CustomEventHandler())
 
 class _Message(BaseModel):
     role: MessageRole
@@ -89,6 +20,7 @@ class _Message(BaseModel):
 
 class _ChatData(BaseModel):
     messages: List[_Message]
+
 
 stream_part_types = {
     "text": "0",
@@ -105,7 +37,7 @@ stream_part_types = {
 async def chat(
     request: Request,
     data: _ChatData,
-    chat_engine: BaseChatEngine = Depends(get_chat_engine),
+    chat_engine: ChatEngine = Depends(get_chat_engine),
 ):
     # check preconditions and get last message
     if len(data.messages) == 0:
@@ -129,20 +61,37 @@ async def chat(
     ]
 
     # query chat engine
-    response = await chat_engine.astream_chat(lastMessage.content, messages)
+    handler = chat_engine.run(query=lastMessage.content, messages=messages or [])
 
     # stream response
     async def event_generator():
-        while True:
+        async for event in handler.stream_events():
             if await request.is_disconnected():
                 break
-            next_event: EventToSend = event_q.get(timeout=30.0)
-            if next_event.type == "text":
-                yield f"{stream_part_types[next_event.type]}:{json.dumps(next_event.message)}\n"
+
+            if not isinstance(event, ProgressEvent):
+                continue
+                
+            if event.type == "text":
+                yield f"{stream_part_types[event.type]}:{json.dumps(event.message)}\n"
             else:
-                yield f"{stream_part_types[next_event.type]}:{json.dumps([next_event.model_dump()])}\n"
-            if next_event.is_last_event:
-                break
+                yield f"{stream_part_types[event.type]}:{json.dumps([event.model_dump()])}\n"
+        
+        # get final result
+        final_result = await handler
+        messages = final_result["messages"]
+        response = final_result["response"]
+        
+        # count tokens
+        token_counter = TokenCounter()
+        input_tokens = token_counter.estimate_tokens_in_messages(messages)
+        output_tokens = token_counter.get_string_tokens(response)
+        message = f"Input tokens: {input_tokens}, output tokens: {output_tokens}"
+
+        # send final result
+        stream_part_type = stream_part_types["data"]
+        yield f"{stream_part_type}:{message}\n"
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
